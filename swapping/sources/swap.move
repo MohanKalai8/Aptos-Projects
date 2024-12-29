@@ -62,7 +62,123 @@ module swap_account::Swap{
                 lp_burn,
             },
         );
+    }
 
+    public entry fun add_liquidity<X, Y>(sender: &signer, x_amount : u64,y_amount: u64) acquires Pair{
+        // Make sure the pair exists
+        assert!(exists<Pair<X, Y>>(@swap_account), 1000);
+
+        // Borrow the pair data from global storage
+        let pair = borrow_global_mut<Pair<X, Y>>(@swap_account);
+
+        // Convert the amount of tokens to u128 to prevent overflow during calculatoins
+        let x_amount = (x_amount as u128) ;
+        let y_amount = (y_amount as u128) ;
+
+        // Get the current reserves for token X and Y
+        let x_reserve = (coin::value(&pair.x_coin) as u128);
+        let y_reserve = (coin::value(&pair.y_coin) as u128);
+
+        // Calculating the optimal amount of Y to be added given the amount of X
+        let y_amount_optimal = quote(x_amount, x_reserve, y_reserve);
+
+        // Choose the smaller of the actual Y amount and the optimal Y amount
+        if (y_amount_optimal <= y_amount){
+            y_amount = y_amount_optimal;
+        }else{
+            let x_amount_optimal = quote(y_amount, y_reserve, x_reserve);
+            x_amount = x_amount_optimal;
+        };
+
+        // Withdraw X and Y tokens from the sender's account
+        let x_amount_coin = coin::withdraw<X>(sender, (x_amount as u64));
+        let y_amount_coin = coin::withdraw<Y>(sender, (y_amount as u64));
+
+        // Deposit the withdraw tokens into the Pair
+        coin::merge(&mut pair.x_coin, x_amount_coin);
+        coin::merge(&mut pair.y_coin, y_amount_coin);
+
+        // Calculate the liquidity to be minted and mint Lp tokens accordingly
+        let liquidity;
+        let total_supply = *option::borrow(&coin::supply<LP<X, Y>>());
+        if (total_supply == 0){
+            liquidity = sqrt(((x_amount * y_amount) as u128)) - MINIMUM_LIQUIDITY;
+            let lp_locked = coin::mint(MINIMUM_LIQUIDITY, &pair.lp_mint);
+            coin::merge(&mut pair.lp_locked, lp_locked);
+        }else{
+            liquidity = (min(
+                Math::mul_div(x_amount, total_supply, x_reserve),
+                Math::mul_div(y_amount, total_supply, y_reserve),
+            ) as u64);
+        };
+
+        // Mint the liquidty and deposit it into the sender's account
+        let lp_coin = coin::mint<LP<X, Y>>(liquidity, &pair.lp_mint);
+        let addr = address_of(sender);
+        if (!coin::is_account_registered<LP<X, Y>>(addr)){
+            coin::register<LP<X, Y>>(sender);
+        };
+        coin::deposit(addr, lp_coin);
+    }
+
+    public entry fun remove_liquidity<X, Y>(sender: &signer, liquidity: u64) acquires Pair{
+        // Make sure the pair exists
+        assert!(exists<Pair<X, Y>>(@swap_account), 1000);
+
+        // Borrow the pair data from global storage
+        let pair = borrow_global_mut<Pair<X, Y>>(@swap_account);
+
+        // Withdraw liquidity from the sender's account
+        let liquidity_coin = coin::withdraw<LP<X, Y>>(sender, liquidity);
+        coin::burn(liquidity_coin, &pair.lp_burn);
+
+        // Get the total supply of LP tokens, and the current reserves for token X and Y
+        let total_supply = *option::borrow(&coin::supply<LP<X, Y>>());
+        let x_reserve = (coin::value(&pair.x_coin) as u128);
+        let y_reserve = (coin::value(&pair.y_coin) as u128);
+
+        // Calculate the amount of X and Y to be withdrawn
+        let x_amount = Math::mul_div((liquidity as u128), x_reserve, total_supply);
+        let y_amount = Math::mul_div((liquidity as u128), y_reserve, total_supply);
+
+        // Extract the amounts of X and Y tokens from the pair
+        let x_amount_coin = coin::extract<X>(&mut pair.x_coin, (x_amount as u64));
+        let y_amount_coin = coin::extract<Y>(&mut pair.y_coin, (y_amount as u64));
+
+        // Deposit the extracted tokens back into the sender's account
+        coin::deposit(address_of(sender), x_amount_coin);
+        coin::deposit(address_of(sender), y_amount_coin);
+    }
+
+    public entry fun swap<X, Y>(sender: &signer, amount_in: u64) acquires Pair{
+        // Make sure the pair exists
+        assert!(exists<Pair<X, Y>>(@swap_account), 1000);
+
+        // Borrow the pair data from global storage
+        let pair = borrow_global_mut<Pair<X, Y>>(@swap_account);
+
+        // Withdraw the input token X from the sender's account
+        let coin_in = coin::withdraw<X>(sender, amount_in);
+
+        // Register the sender's account for token Y if not already registered
+        if (!coin::is_account_registered<Y>(address_of(sender))){
+            coin::register<Y>(sender);
+        };
+
+        // Get the current reserves for token X and Y
+        let x_reserve = (coin::value(&pair.x_coin) as u128);
+        let y_reserve = (coin::value(&pair.y_coin) as u128);
+
+        // Calculate the amount of output token Y to be received
+        let amount_out = get_amount_out((amount_in as u128), x_reserve, y_reserve);
+
+        // Deposit the input token X into the pair
+        coin::merge(&mut pair.x_coin, coin_in);
+
+        let amount_out_coin = coin::extract(&mut pair.y_coin, (amount_out as u64));
+
+        // Deposit the received token Y back into the sender's account
+        coin::deposit(address_of(sender), amount_out_coin);
     }
 
     public fun pair_exists<X, Y>(addr: address) : bool {
@@ -87,8 +203,22 @@ module swap_account::Swap{
 }
 
 module swap_account::Math{
-    public fun min(){}
-    public fun sqrt(){}
+    public fun min(x:u128, y:u128):u128{
+        if (x < y){
+            x
+        }else{
+            y
+        }
+    }
+    public fun sqrt(x:u128):u64{
+        let z = (x + 1) / 2;
+        let y = x;
+        while (z < y){
+            y = z;
+            z = (x / z + z) / 2;
+        };
+        (y as u64)
+    }
     public fun mul_div(x_amount:u128, x_reserve:u128, y_reserve:u128) : u128{
         x_amount * y_reserve / x_reserve
     }
